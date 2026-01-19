@@ -28,8 +28,6 @@ function getEnclosureUrl(item: any): string | null {
   return enc["@_url"] || null;
 }
 
-/* -------------------- audio + transcription -------------------- */
-
 async function downloadAudioAsArrayBuffer(audioUrl: string) {
   const res = await fetch(audioUrl, { redirect: "follow" });
   if (!res.ok) throw new Error(`Audio download failed: ${res.status}`);
@@ -39,7 +37,6 @@ async function downloadAudioAsArrayBuffer(audioUrl: string) {
 async function transcribeInChunks(openaiKey: string, audioUrl: string): Promise<string> {
   const buffer = await downloadAudioAsArrayBuffer(audioUrl);
 
-  // ~8MB chunks to reduce "input too large" risk and keep each request reasonable
   const CHUNK_SIZE = 8 * 1024 * 1024;
 
   let offset = 0;
@@ -73,7 +70,7 @@ async function transcribeInChunks(openaiKey: string, audioUrl: string): Promise<
     transcript += json.text + "\n\n";
     part++;
 
-    // Guardrails: avoid runaway invocations
+    // Guardrail: avoid runaway invocation on extremely long audio
     if (part > 30) {
       console.log("INGEST_BG reached chunk cap (30). Stopping early.");
       break;
@@ -86,27 +83,21 @@ async function transcribeInChunks(openaiKey: string, audioUrl: string): Promise<
 /* -------------------- handler -------------------- */
 
 export const handler: Handler = async () => {
-  let guid: string | null = null;
+  let newestGuid: string | null = null;
 
   try {
-    console.log("INGEST_BG start");
+    console.log("INGEST_BG start (backfill 7, transcribe newest only)");
 
-    if (!supabaseAdmin) {
-      throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
-    }
+    if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
 
     const openaiKey = process.env.OPENAI_API_KEY;
-    if (!openaiKey) {
-      throw new Error("Missing OPENAI_API_KEY");
-    }
+    if (!openaiKey) throw new Error("Missing OPENAI_API_KEY");
 
     // 1) Fetch RSS
     const rssUrl = "https://anchor.fm/s/f7cac464/podcast/rss";
     const rssRes = await fetch(rssUrl);
     if (!rssRes.ok) throw new Error(`RSS fetch failed: ${rssRes.status}`);
-
     const xml = await rssRes.text();
-    console.log("INGEST_BG rss fetched");
 
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: "@_" });
     const parsed = parser.parse(xml);
@@ -115,100 +106,105 @@ export const handler: Handler = async () => {
     const list = Array.isArray(items) ? items : items ? [items] : [];
     if (!list.length) throw new Error("No RSS items found");
 
-    // Newest-first
-    const newest = list[0];
-    const title = newest?.title ?? "AI Daily Brief";
-    const pubDate = newest?.pubDate;
-    guid = getGuid(newest) || `${title}-${pubDate}`;
-    const audioUrl = getEnclosureUrl(newest);
+    const itemsToIngest = list.slice(0, 7);
+    console.log(`INGEST_BG found ${list.length} RSS items, ingesting ${itemsToIngest.length}`);
 
-    if (!pubDate || !audioUrl) throw new Error("RSS item missing pubDate or audio enclosure");
+    // 2) Upsert the latest 7 rows (fast, no transcription yet)
+    for (let i = 0; i < itemsToIngest.length; i++) {
+      const item = itemsToIngest[i];
+      const title = item?.title ?? "AI Daily Brief";
+      const pubDate = item?.pubDate;
+      const guid = getGuid(item) || `${title}-${pubDate}`;
+      const audioUrl = getEnclosureUrl(item);
 
-    const published_at = new Date(pubDate).toISOString();
-    const published_date = toYYYYMMDD_ET(pubDate);
+      if (!pubDate || !audioUrl || !guid) {
+        console.log("INGEST_BG skipping item missing fields", { hasPubDate: !!pubDate, hasAudio: !!audioUrl, hasGuid: !!guid });
+        continue;
+      }
 
-    console.log("INGEST_BG newest episode", { guid, published_date });
+      const published_at = new Date(pubDate).toISOString();
+      const published_date = toYYYYMMDD_ET(pubDate);
 
-    // 2) Upsert a row immediately (visible proof)
-    // NOTE: requires a unique constraint on id (your primary key already is).
-    const { error: upsertErr } = await supabaseAdmin.from("episodes").upsert(
-      [
-        {
-          id: guid,
-          title,
-          published_at,
-          published_date,
-          audio_url: audioUrl,
-          transcript: "__PROCESSING_TRANSCRIPT__",
-        },
-      ],
-      { onConflict: "id" }
-    );
+      if (i === 0) newestGuid = guid;
 
-    if (upsertErr) throw new Error(`Upsert failed: ${upsertErr.message}`);
-    console.log("INGEST_BG upserted processing marker");
+      const { error: upsertErr } = await supabaseAdmin.from("episodes").upsert(
+        [
+          {
+            id: guid,
+            title,
+            published_at,
+            published_date,
+            audio_url: audioUrl,
+            // only set processing marker for newest if transcript isn't present yet
+            ...(i === 0 ? { transcript: "__PROCESSING_TRANSCRIPT__" } : {}),
+          },
+        ],
+        { onConflict: "id" }
+      );
 
-    // 3) Fetch existing to decide whether to re-transcribe
-    const { data: existing, error: existErr } = await supabaseAdmin
+      if (upsertErr) throw new Error(`Upsert failed for ${guid}: ${upsertErr.message}`);
+    }
+
+    console.log("INGEST_BG upserted backfill rows", { newestGuid });
+
+    // 3) Transcribe newest ONLY (keeps runtime safe)
+    if (!newestGuid) throw new Error("Could not determine newestGuid");
+
+    const { data: newestRow, error: newestErr } = await supabaseAdmin
       .from("episodes")
-      .select("id, transcript")
-      .eq("id", guid)
+      .select("id, title, audio_url, transcript, published_at, published_date")
+      .eq("id", newestGuid)
       .maybeSingle();
 
-    if (existErr) throw new Error(`DB check failed: ${existErr.message}`);
+    if (newestErr) throw new Error(`Failed reading newest row: ${newestErr.message}`);
+    if (!newestRow?.audio_url) throw new Error("Newest row missing audio_url");
 
-    const existingTranscript = (existing as any)?.transcript as string | null | undefined;
-
+    const existingTranscript = (newestRow as any)?.transcript as string | null | undefined;
     const hasRealTranscript =
       !!existingTranscript &&
       existingTranscript !== "__PROCESSING_TRANSCRIPT__" &&
+      !existingTranscript.startsWith("__ERROR__") &&
       existingTranscript.length > 2000;
 
     if (hasRealTranscript) {
-      console.log("INGEST_BG transcript already present, skipping transcription");
+      console.log("INGEST_BG newest already has transcript, skipping transcription");
     } else {
-      // 4) Transcribe (chunked)
-      console.log("INGEST_BG starting transcription");
-      const transcript = await transcribeInChunks(openaiKey, audioUrl);
-      console.log("INGEST_BG transcription done", { transcript_chars: transcript.length });
+      console.log("INGEST_BG transcribing newest", { newestGuid });
 
-      // 5) Save transcript
+      const transcript = await transcribeInChunks(openaiKey, newestRow.audio_url as string);
+
       const { error: updateErr } = await supabaseAdmin
         .from("episodes")
         .update({
-          title,
-          published_at,
-          published_date,
-          audio_url: audioUrl,
           transcript,
         })
-        .eq("id", guid);
+        .eq("id", newestGuid);
 
       if (updateErr) throw new Error(`Update transcript failed: ${updateErr.message}`);
-      console.log("INGEST_BG transcript saved");
+
+      console.log("INGEST_BG transcript saved", { newestGuid, chars: transcript.length });
     }
 
-    // Background functions can return, but we only do it ONCE at the end
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         status: "ok",
-        id: guid,
-        note: "Background job finished (stage 1 transcript).",
+        newestGuid,
+        ingested_count: itemsToIngest.length,
+        note: "Backfilled latest 7 episodes; transcribed newest only (stage 1).",
       }),
     };
   } catch (e: any) {
     console.log("INGEST_BG error", e?.message || e);
 
-    // If we created a row but errored, leave a clue in transcript field
-    // (best effort; do not throw if this fails)
+    // Best-effort: mark newest row with error
     try {
-      if (supabaseAdmin && guid) {
+      if (supabaseAdmin && newestGuid) {
         await supabaseAdmin
           .from("episodes")
           .update({ transcript: `__ERROR__: ${String(e?.message || e).slice(0, 500)}` })
-          .eq("id", guid);
+          .eq("id", newestGuid);
       }
     } catch {
       // ignore
