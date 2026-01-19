@@ -1,5 +1,5 @@
 import type { Handler } from "@netlify/functions";
-import { supabase } from "./_supabase";
+import { supabasePublic } from "./_supabase";
 
 export const handler: Handler = async (event) => {
   const date = event.queryStringParameters?.date;
@@ -12,7 +12,7 @@ export const handler: Handler = async (event) => {
     };
   }
 
-  const { data, error } = await supabase
+  const { data, error } = await supabasePublic!
     .from("episodes")
     .select("*")
     .eq("published_date", date)

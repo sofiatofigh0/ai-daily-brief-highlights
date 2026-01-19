@@ -12,6 +12,7 @@
   "dependencies": {
     "@netlify/functions": "^5.1.2",
     "@supabase/supabase-js": "^2.90.1",
+    "fast-xml-parser": "^5.3.3",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
