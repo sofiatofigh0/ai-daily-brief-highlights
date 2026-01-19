@@ -39,7 +39,7 @@ async function downloadAudioAsArrayBuffer(audioUrl: string) {
 async function transcribeInChunks(openaiKey: string, audioUrl: string): Promise<string> {
   const buffer = await downloadAudioAsArrayBuffer(audioUrl);
 
-  // ~8MB chunks keeps us under model limits
+  // ~8MB chunks to reduce "input too large" risk and keep each request reasonable
   const CHUNK_SIZE = 8 * 1024 * 1024;
 
   let offset = 0;
@@ -73,8 +73,11 @@ async function transcribeInChunks(openaiKey: string, audioUrl: string): Promise<
     transcript += json.text + "\n\n";
     part++;
 
-    // Safety: avoid runaway time in serverless
-    if (part > 30) break; // very long eps: cap chunks
+    // Guardrails: avoid runaway invocations
+    if (part > 30) {
+      console.log("INGEST_BG reached chunk cap (30). Stopping early.");
+      break;
+    }
   }
 
   return transcript.trim();
@@ -83,33 +86,25 @@ async function transcribeInChunks(openaiKey: string, audioUrl: string): Promise<
 /* -------------------- handler -------------------- */
 
 export const handler: Handler = async () => {
+  let guid: string | null = null;
+
   try {
-    console.log("INGEST_BG stage1 start");
+    console.log("INGEST_BG start");
 
     if (!supabaseAdmin) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: "Missing SUPABASE_SERVICE_ROLE_KEY" }),
-      };
+      throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
     }
 
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!openaiKey) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: "Missing OPENAI_API_KEY" }),
-      };
+      throw new Error("Missing OPENAI_API_KEY");
     }
 
     // 1) Fetch RSS
     const rssUrl = "https://anchor.fm/s/f7cac464/podcast/rss";
     const rssRes = await fetch(rssUrl);
-    if (!rssRes.ok) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: `RSS fetch failed: ${rssRes.status}` }),
-      };
-    }
+    if (!rssRes.ok) throw new Error(`RSS fetch failed: ${rssRes.status}`);
+
     const xml = await rssRes.text();
     console.log("INGEST_BG rss fetched");
 
@@ -118,119 +113,110 @@ export const handler: Handler = async () => {
 
     const items = parsed?.rss?.channel?.item;
     const list = Array.isArray(items) ? items : items ? [items] : [];
-    if (!list.length) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: "No RSS items found" }),
-      };
-    }
+    if (!list.length) throw new Error("No RSS items found");
 
     // Newest-first
     const newest = list[0];
     const title = newest?.title ?? "AI Daily Brief";
     const pubDate = newest?.pubDate;
-    const guid = getGuid(newest) || `${title}-${pubDate}`;
+    guid = getGuid(newest) || `${title}-${pubDate}`;
     const audioUrl = getEnclosureUrl(newest);
 
-    if (!pubDate || !audioUrl) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: "RSS item missing pubDate or audio enclosure" }),
-      };
-    }
+    if (!pubDate || !audioUrl) throw new Error("RSS item missing pubDate or audio enclosure");
 
     const published_at = new Date(pubDate).toISOString();
     const published_date = toYYYYMMDD_ET(pubDate);
 
-    console.log("INGEST_BG newest", { guid, published_date });
+    console.log("INGEST_BG newest episode", { guid, published_date });
 
-    // 2) Ensure row exists (insert placeholder if missing)
-    const { data: existing, error: existErr } = await supabaseAdmin
-      .from("episodes")
-      .select("id, transcript")
-      .eq("id", guid)
-      .maybeSingle();
-
-    if (existErr) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: `DB check failed: ${existErr.message}` }),
-      };
-    }
-
-    if (!existing?.id) {
-      const { error: insErr } = await supabaseAdmin.from("episodes").insert([
+    // 2) Upsert a row immediately (visible proof)
+    // NOTE: requires a unique constraint on id (your primary key already is).
+    const { error: upsertErr } = await supabaseAdmin.from("episodes").upsert(
+      [
         {
           id: guid,
           title,
           published_at,
           published_date,
           audio_url: audioUrl,
-          // transcript will be filled next
+          transcript: "__PROCESSING_TRANSCRIPT__",
         },
-      ]);
-      if (insErr) {
-        return {
-          statusCode: 500,
-          body: JSON.stringify({ error: `Insert placeholder failed: ${insErr.message}` }),
-        };
-      }
-      console.log("INGEST_BG inserted placeholder row");
-    }
+      ],
+      { onConflict: "id" }
+    );
 
-    // 3) If transcript already exists and looks non-empty, skip
-    if (existing?.transcript && (existing.transcript as string).length > 2000) {
-      console.log("INGEST_BG transcript already present, noop");
-      return {
-        statusCode: 200,
-        body: JSON.stringify({
-          status: "noop",
-          message: "Transcript already saved",
-          id: guid,
-          published_date,
-        }),
-      };
-    }
+    if (upsertErr) throw new Error(`Upsert failed: ${upsertErr.message}`);
+    console.log("INGEST_BG upserted processing marker");
 
-    // 4) Transcribe (chunked)
-    console.log("INGEST_BG starting transcription");
-    const transcript = await transcribeInChunks(openaiKey, audioUrl);
-    console.log("INGEST_BG transcription done", { transcript_chars: transcript.length });
-
-    // 5) Save transcript (stage 1)
-    const { error: updateErr } = await supabaseAdmin
+    // 3) Fetch existing to decide whether to re-transcribe
+    const { data: existing, error: existErr } = await supabaseAdmin
       .from("episodes")
-      .update({
-        title,
-        published_at,
-        published_date,
-        audio_url: audioUrl,
-        transcript,
-      })
-      .eq("id", guid);
+      .select("id, transcript")
+      .eq("id", guid)
+      .maybeSingle();
 
-    if (updateErr) {
-      return {
-        statusCode: 500,
-        body: JSON.stringify({ error: `Update transcript failed: ${updateErr.message}` }),
-      };
+    if (existErr) throw new Error(`DB check failed: ${existErr.message}`);
+
+    const existingTranscript = (existing as any)?.transcript as string | null | undefined;
+
+    const hasRealTranscript =
+      !!existingTranscript &&
+      existingTranscript !== "__PROCESSING_TRANSCRIPT__" &&
+      existingTranscript.length > 2000;
+
+    if (hasRealTranscript) {
+      console.log("INGEST_BG transcript already present, skipping transcription");
+    } else {
+      // 4) Transcribe (chunked)
+      console.log("INGEST_BG starting transcription");
+      const transcript = await transcribeInChunks(openaiKey, audioUrl);
+      console.log("INGEST_BG transcription done", { transcript_chars: transcript.length });
+
+      // 5) Save transcript
+      const { error: updateErr } = await supabaseAdmin
+        .from("episodes")
+        .update({
+          title,
+          published_at,
+          published_date,
+          audio_url: audioUrl,
+          transcript,
+        })
+        .eq("id", guid);
+
+      if (updateErr) throw new Error(`Update transcript failed: ${updateErr.message}`);
+      console.log("INGEST_BG transcript saved");
     }
 
-    console.log("INGEST_BG transcript saved");
-
+    // Background functions can return, but we only do it ONCE at the end
     return {
       statusCode: 200,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        status: "transcript_saved",
+        status: "ok",
         id: guid,
-        published_date,
-        transcript_chars: transcript.length,
+        note: "Background job finished (stage 1 transcript).",
       }),
     };
   } catch (e: any) {
     console.log("INGEST_BG error", e?.message || e);
+
+    // If we created a row but errored, leave a clue in transcript field
+    // (best effort; do not throw if this fails)
+    try {
+      if (supabaseAdmin && guid) {
+        await supabaseAdmin
+          .from("episodes")
+          .update({ transcript: `__ERROR__: ${String(e?.message || e).slice(0, 500)}` })
+          .eq("id", guid);
+      }
+    } catch {
+      // ignore
+    }
+
     return {
       statusCode: 500,
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ error: e?.message || "Unknown error" }),
     };
   }
