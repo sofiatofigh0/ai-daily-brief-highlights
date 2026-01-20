@@ -8,3 +8,6 @@
 [[scheduled.functions]]
   name = "ingest-episodes-background"
   cron = "*/30 * * * *"
+
+[functions]
+  node_bundler = "esbuild"
