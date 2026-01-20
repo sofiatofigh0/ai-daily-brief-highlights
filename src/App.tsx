@@ -141,8 +141,6 @@ export default function App() {
             <div className="episodeHeader">
               <div className="episodeTitle">{selectedEpisode.title}</div>
               <div className="episodeMeta">
-                <span>{selectedEpisode.published_date}</span>
-                <span>•</span>
                 <span>{new Date(selectedEpisode.published_at).toLocaleString()}</span>
               </div>
             </div>
