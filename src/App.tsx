@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
+import { supabase } from "./lib/supabaseClient";
 
 type Highlights = {
   one_sentence_summary: string;
@@ -11,194 +12,190 @@ type Highlights = {
 type EpisodeRow = {
   id: string;
   title: string;
+  published_at: string;
   published_date: string; // YYYY-MM-DD
-  highlights: Highlights;
+  highlights: Highlights | null;
 };
 
 export default function App() {
-  const [loading, setLoading] = useState(true);
-  const [dates, setDates] = useState<string[]>([]);
+  const [episodes, setEpisodes] = useState<EpisodeRow[]>([]);
   const [selectedDate, setSelectedDate] = useState<string>("");
-  const [episode, setEpisode] = useState<EpisodeRow | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>("");
 
-  const apiBase = useMemo(() => "", []);
+  async function loadEpisodes() {
+    setLoading(true);
+    setError("");
 
-  async function fetchJson<T>(path: string): Promise<T> {
-    const res = await fetch(`${apiBase}${path}`);
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(txt || `Request failed: ${res.status}`);
+    const { data, error } = await supabase
+      .from("episodes")
+      .select("id,title,published_at,published_date,highlights")
+      .order("published_at", { ascending: false });
+
+    if (error) {
+      setLoading(false);
+      setError(error.message);
+      return;
     }
-    return res.json();
+
+    const rows = (data ?? []) as EpisodeRow[];
+    setEpisodes(rows);
+
+    // Default to latest date (even if highlights are null)
+    if (rows.length > 0) {
+      const latestDate = rows[0]?.published_date;
+      if (!selectedDate && latestDate) setSelectedDate(latestDate);
+    }
+
+    setLoading(false);
   }
 
   useEffect(() => {
-    (async () => {
-      try {
-        setLoading(true);
-        setError("");
-
-        // 1) Load available dates
-        const datesResp = await fetchJson<{ dates: string[] }>(
-          "/.netlify/functions/dates"
-        );
-        setDates(datesResp.dates || []);
-
-        // 2) Load latest episode
-        const latest = await fetchJson<EpisodeRow>(
-          "/.netlify/functions/latest"
-        );
-        setEpisode(latest);
-        setSelectedDate(latest?.published_date || "");
-      } catch (e: any) {
-        setError(e?.message || "Something went wrong");
-      } finally {
-        setLoading(false);
-      }
-    })();
+    loadEpisodes();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function onChangeDate(date: string) {
-    try {
-      setSelectedDate(date);
-      setLoading(true);
-      setError("");
-
-      const data = await fetchJson<EpisodeRow>(
-        `/.netlify/functions/episode?date=${encodeURIComponent(date)}`
-      );
-      setEpisode(data);
-    } catch (e: any) {
-      setError(e?.message || "Failed to load that date");
-    } finally {
-      setLoading(false);
+  const dateOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const e of episodes) {
+      if (e.published_date) set.add(e.published_date);
     }
-  }
+    return Array.from(set).sort((a, b) => (a < b ? 1 : -1));
+  }, [episodes]);
+
+  // Pick the newest episode for the selected date.
+  // This avoids "blank" issues when multiple episodes share a date.
+  const selectedEpisode = useMemo(() => {
+    if (!episodes.length) return null;
+
+    const date = selectedDate || episodes[0].published_date;
+
+    const matches = episodes.filter((e) => e.published_date === date);
+
+    if (matches.length > 0) {
+      // episodes already sorted newest-first by published_at from the query,
+      // so matches[0] is the newest episode on that date.
+      return matches[0];
+    }
+
+    // Fallback to most recent overall
+    return episodes[0];
+  }, [episodes, selectedDate]);
 
   return (
-    <div style={{ maxWidth: 900, margin: "0 auto", padding: 24 }}>
-      <h1 style={{ marginBottom: 6 }}>AI Daily Brief Highlights</h1>
-      <p style={{ marginTop: 0, opacity: 0.75 }}>
-        Latest by default. Select a date to view past highlights.
-      </p>
+    <div className="page">
+      <div className="container">
+        <h1 className="title">AI Daily Brief Highlights</h1>
+        <p className="subtitle">Latest by default. Select a date to view past highlights.</p>
 
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          alignItems: "center",
-          margin: "16px 0 24px",
-          flexWrap: "wrap",
-        }}
-      >
-        <label style={{ fontWeight: 600 }}>Date</label>
-        <select
-          value={selectedDate}
-          onChange={(e) => onChangeDate(e.target.value)}
-          disabled={!dates.length}
-          style={{ padding: "8px 10px", borderRadius: 8 }}
-        >
-          {dates.map((d) => (
-            <option key={d} value={d}>
-              {d}
-            </option>
-          ))}
-        </select>
+        <div className="controls">
+          <label className="label" htmlFor="dateSelect">
+            Date
+          </label>
 
-        {episode?.published_date && (
-          <span
-            style={{
-              padding: "6px 10px",
-              borderRadius: 999,
-              border: "1px solid rgba(255,255,255,0.2)",
-              fontSize: 12,
-              opacity: 0.9,
-            }}
+          <select
+            id="dateSelect"
+            className="select"
+            value={selectedDate}
+            onChange={(e) => setSelectedDate(e.target.value)}
+            disabled={loading || dateOptions.length === 0}
           >
-            Showing: {episode.published_date}
-          </span>
-        )}
-      </div>
+            {dateOptions.length === 0 ? (
+              <option value="">No episodes yet</option>
+            ) : (
+              dateOptions.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))
+            )}
+          </select>
 
-      {loading && <p>Loading…</p>}
+          <button className="button" onClick={loadEpisodes} disabled={loading}>
+            Refresh
+          </button>
+        </div>
 
-      {error && (
-        <pre
-          style={{
-            background: "rgba(255,0,0,0.08)",
-            padding: 12,
-            borderRadius: 12,
-            whiteSpace: "pre-wrap",
-          }}
-        >
-          {error}
-        </pre>
-      )}
+        {loading && <div className="card">Loading…</div>}
 
-      {!loading && !error && episode && (
-        <div style={{ display: "grid", gap: 18 }}>
-          <div
-            style={{
-              padding: 16,
-              borderRadius: 16,
-              border: "1px solid rgba(255,255,255,0.15)",
-            }}
-          >
-            <div style={{ opacity: 0.8, fontSize: 13, marginBottom: 6 }}>
-              {episode.title}
-            </div>
-            <div style={{ fontSize: 18, fontWeight: 600 }}>
-              {episode.highlights.one_sentence_summary}
-            </div>
+        {!loading && error && (
+          <div className="card">
+            <div style={{ fontWeight: 600, marginBottom: 8 }}>Error</div>
+            <div style={{ opacity: 0.85 }}>{error}</div>
           </div>
+        )}
 
-          <section>
-            <h2 style={{ marginBottom: 8 }}>Top takeaways</h2>
-            <ul>
-              {episode.highlights.top_takeaways.map((t, idx) => (
-                <li key={idx} style={{ marginBottom: 6 }}>
-                  {t}
-                </li>
-              ))}
-            </ul>
-          </section>
+        {!loading && !error && !selectedEpisode && (
+          <div className="card">
+            <div style={{ opacity: 0.85 }}>No episodes found.</div>
+          </div>
+        )}
 
-          <section>
-            <h2 style={{ marginBottom: 8 }}>Stories</h2>
-            <div style={{ display: "grid", gap: 12 }}>
-              {episode.highlights.stories.map((s, idx) => (
-                <div
-                  key={idx}
-                  style={{
-                    padding: 14,
-                    borderRadius: 14,
-                    border: "1px solid rgba(255,255,255,0.12)",
-                  }}
-                >
-                  <div style={{ fontWeight: 700 }}>{s.headline}</div>
-                  <div style={{ opacity: 0.85, marginTop: 6 }}>
-                    {s.why_it_matters}
+        {!loading && !error && selectedEpisode && (
+          <div className="card">
+            <div className="episodeHeader">
+              <div className="episodeTitle">{selectedEpisode.title}</div>
+              <div className="episodeMeta">
+                <span>{selectedEpisode.published_date}</span>
+                <span style={{ opacity: 0.6 }}>•</span>
+                <span style={{ opacity: 0.8 }}>
+                  {new Date(selectedEpisode.published_at).toLocaleString()}
+                </span>
+              </div>
+            </div>
+
+            {/* Bulletproof null check: never touch highlights fields if null */}
+            {!selectedEpisode.highlights ? (
+              <div className="processing">
+                <div style={{ fontWeight: 600, marginBottom: 8 }}>Highlights are processing…</div>
+                <div style={{ opacity: 0.8, marginBottom: 12 }}>
+                  We have the episode metadata, but highlights haven’t been generated yet for this date.
+                </div>
+                <div style={{ opacity: 0.7 }}>Try Refresh in a minute.</div>
+              </div>
+            ) : (
+              <div className="highlights">
+                <div className="summary">
+                  <div className="sectionTitle">One-sentence summary</div>
+                  <div style={{ opacity: 0.9 }}>{selectedEpisode.highlights.one_sentence_summary}</div>
+                </div>
+
+                <div className="section">
+                  <div className="sectionTitle">Top takeaways</div>
+                  <ul>
+                    {(selectedEpisode.highlights.top_takeaways ?? []).map((t, idx) => (
+                      <li key={idx}>{t}</li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="section">
+                  <div className="sectionTitle">Stories</div>
+                  <div className="stories">
+                    {(selectedEpisode.highlights.stories ?? []).map((s, idx) => (
+                      <div key={idx} className="story">
+                        <div className="storyHeadline">{s.headline}</div>
+                        <div className="storyWhy">{s.why_it_matters}</div>
+                      </div>
+                    ))}
                   </div>
                 </div>
-              ))}
-            </div>
-          </section>
 
-          {episode.highlights.action_items?.length ? (
-            <section>
-              <h2 style={{ marginBottom: 8 }}>Action items</h2>
-              <ul>
-                {episode.highlights.action_items.map((a, idx) => (
-                  <li key={idx} style={{ marginBottom: 6 }}>
-                    {a}
-                  </li>
-                ))}
-              </ul>
-            </section>
-          ) : null}
-        </div>
-      )}
+                {selectedEpisode.highlights.action_items?.length ? (
+                  <div className="section">
+                    <div className="sectionTitle">Action items</div>
+                    <ul>
+                      {selectedEpisode.highlights.action_items.map((a, idx) => (
+                        <li key={idx}>{a}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
