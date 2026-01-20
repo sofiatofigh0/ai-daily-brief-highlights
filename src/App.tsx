@@ -1,8 +1,12 @@
-// src/App.tsx
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { supabase } from "./lib/supabaseClient";
-import Calendar from "./Calendar";
+
+type Source = {
+  title: string;
+  url: string;
+  snippet?: string;
+};
 
 type Highlights = {
   one_sentence_summary: string;
@@ -19,6 +23,7 @@ type EpisodeRow = {
   published_at: string;
   published_date: string; // YYYY-MM-DD
   highlights: Highlights | null;
+  sources?: Source[] | null;
 };
 
 export default function App() {
@@ -33,7 +38,7 @@ export default function App() {
 
     const { data, error } = await supabase
       .from("episodes")
-      .select("id,title,published_at,published_date,highlights")
+      .select("id,title,published_at,published_date,highlights,sources")
       .order("published_at", { ascending: false });
 
     if (error) {
@@ -71,13 +76,11 @@ export default function App() {
 
     const date = selectedDate || episodes[0].published_date;
     const matches = episodes.filter((e) => e.published_date === date);
-
-    if (matches.length > 0) return matches[0];
-    return episodes[0];
+    return matches.length > 0 ? matches[0] : episodes[0];
   }, [episodes, selectedDate]);
 
   const hasNewFormat = (h: Highlights) =>
-    Boolean(h.what_changed?.trim() || h.why_it_matters_now?.trim() || h.who_should_care?.trim());
+    Boolean(h.what_changed || h.why_it_matters_now || h.who_should_care);
 
   return (
     <div className="page">
@@ -86,35 +89,29 @@ export default function App() {
         <p className="subtitle">Latest by default. Select a date to view past highlights.</p>
 
         <div className="controls">
-          <Calendar
-            availableDates={dateOptions}
-            selectedDate={selectedDate}
-            onDateSelect={setSelectedDate}
-            disabled={loading}
-          />
+          <label className="label" htmlFor="dateSelect">
+            Date
+          </label>
 
-          <button className="refresh-button" onClick={loadEpisodes} disabled={loading}>
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 16 16"
-              fill="none"
-              xmlns="http://www.w3.org/2000/svg"
-            >
-              <path
-                d="M14 8C14 11.3137 11.3137 14 8 14C4.68629 14 2 11.3137 2 8C2 4.68629 4.68629 2 8 2C9.84566 2 11.4922 2.85839 12.5715 4.20991"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              />
-              <path
-                d="M14 4L12 6L10 4"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
+          <select
+            id="dateSelect"
+            className="select"
+            value={selectedDate}
+            onChange={(e) => setSelectedDate(e.target.value)}
+            disabled={loading || dateOptions.length === 0}
+          >
+            {dateOptions.length === 0 ? (
+              <option value="">No episodes yet</option>
+            ) : (
+              dateOptions.map((d) => (
+                <option key={d} value={d}>
+                  {d}
+                </option>
+              ))
+            )}
+          </select>
+
+          <button className="button" onClick={loadEpisodes} disabled={loading}>
             Refresh
           </button>
         </div>
@@ -123,15 +120,13 @@ export default function App() {
 
         {!loading && error && (
           <div className="card">
-            <div style={{ fontWeight: 600, marginBottom: 8 }}>Error</div>
-            <div style={{ opacity: 0.85 }}>{error}</div>
+            <strong>Error</strong>
+            <div>{error}</div>
           </div>
         )}
 
         {!loading && !error && !selectedEpisode && (
-          <div className="card">
-            <div style={{ opacity: 0.85 }}>No episodes found.</div>
-          </div>
+          <div className="card">No episodes found.</div>
         )}
 
         {!loading && !error && selectedEpisode && (
@@ -140,74 +135,67 @@ export default function App() {
               <div className="episodeTitle">{selectedEpisode.title}</div>
               <div className="episodeMeta">
                 <span>{selectedEpisode.published_date}</span>
-                <span style={{ opacity: 0.6 }}>•</span>
-                <span style={{ opacity: 0.8 }}>{new Date(selectedEpisode.published_at).toLocaleString()}</span>
+                <span>•</span>
+                <span>{new Date(selectedEpisode.published_at).toLocaleString()}</span>
               </div>
             </div>
 
             {!selectedEpisode.highlights ? (
               <div className="processing">
-                <div style={{ fontWeight: 600, marginBottom: 8 }}>Highlights are processing…</div>
-                <div style={{ opacity: 0.8, marginBottom: 12 }}>
-                  We have the episode metadata, but highlights haven’t been generated yet for this date.
-                </div>
-                <div style={{ opacity: 0.7 }}>Try Refresh in a minute.</div>
+                <strong>Highlights are processing…</strong>
+                <div>Transcript is ready, summary coming shortly.</div>
               </div>
             ) : (
               <div className="highlights">
                 <div className="summary">
                   <div className="sectionTitle">One-sentence summary</div>
-                  <div style={{ opacity: 0.9 }}>{selectedEpisode.highlights.one_sentence_summary}</div>
+                  <div>{selectedEpisode.highlights.one_sentence_summary}</div>
                 </div>
 
-                {hasNewFormat(selectedEpisode.highlights) ? (
+                {hasNewFormat(selectedEpisode.highlights) && (
                   <div className="section">
                     <div className="sectionTitle">What changed</div>
-                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
-                      {selectedEpisode.highlights.what_changed || "—"}
-                    </div>
+                    <div>{selectedEpisode.highlights.what_changed}</div>
 
-                    <div className="sectionTitle" style={{ marginTop: 16 }}>
-                      Why it matters now
-                    </div>
-                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
-                      {selectedEpisode.highlights.why_it_matters_now || "—"}
-                    </div>
+                    <div className="sectionTitle">Why it matters now</div>
+                    <div>{selectedEpisode.highlights.why_it_matters_now}</div>
 
-                    <div className="sectionTitle" style={{ marginTop: 16 }}>
-                      Who should care
-                    </div>
-                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
-                      {selectedEpisode.highlights.who_should_care || "—"}
-                    </div>
+                    <div className="sectionTitle">Who should care</div>
+                    <div>{selectedEpisode.highlights.who_should_care}</div>
                   </div>
-                ) : null}
+                )}
 
                 <div className="section">
                   <div className="sectionTitle">Top takeaways</div>
                   <ul>
-                    {(selectedEpisode.highlights.top_takeaways ?? []).map((t, idx) => (
-                      <li key={idx}>{t}</li>
+                    {selectedEpisode.highlights.top_takeaways.map((t, i) => (
+                      <li key={i}>{t}</li>
                     ))}
                   </ul>
                 </div>
 
                 <div className="section">
                   <div className="sectionTitle">Stories</div>
-                  <div className="stories">
-                    {(selectedEpisode.highlights.stories ?? []).map((s, idx) => (
-                      <div key={idx} className="story">
-                        <div className="storyHeadline">{s.headline}</div>
-                        <div className="storyWhy">{s.why_it_matters}</div>
-                      </div>
-                    ))}
-                  </div>
+                  {selectedEpisode.highlights.stories.map((s, i) => (
+                    <div key={i} className="story">
+                      <div className="storyHeadline">{s.headline}</div>
+                      <div>{s.why_it_matters}</div>
+                    </div>
+                  ))}
                 </div>
 
-                {!hasNewFormat(selectedEpisode.highlights) ? (
-                  <div style={{ opacity: 0.6, marginTop: 12 }}>
-                    Note: this episode uses the older highlights format. Newer episodes will include “What changed / Why it
-                    matters now / Who should care.”
+                {selectedEpisode.sources?.length ? (
+                  <div className="section">
+                    <div className="sectionTitle">Sources</div>
+                    <ul>
+                      {selectedEpisode.sources.map((src, i) => (
+                        <li key={i}>
+                          <a href={src.url} target="_blank" rel="noreferrer">
+                            {src.title}
+                          </a>
+                        </li>
+                      ))}
+                    </ul>
                   </div>
                 ) : null}
               </div>

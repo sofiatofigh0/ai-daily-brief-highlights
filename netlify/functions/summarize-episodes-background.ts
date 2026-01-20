@@ -1,7 +1,12 @@
-// netlify/functions/summarize-episodes-background.ts
 import type { Handler } from "@netlify/functions";
 import OpenAI from "openai";
 import { supabaseAdmin } from "./_supabase";
+
+type WebSource = {
+  title: string;
+  url: string;
+  snippet?: string;
+};
 
 type Highlights = {
   one_sentence_summary: string;
@@ -56,9 +61,43 @@ function validateHighlights(h: any): Highlights {
   return h as Highlights;
 }
 
+async function tavilySearch(query: string, maxResults = 5): Promise<WebSource[]> {
+  const key = process.env.TAVILY_API_KEY;
+  if (!key) throw new Error("Missing TAVILY_API_KEY");
+
+  const resp = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      api_key: key,
+      query,
+      max_results: maxResults,
+      search_depth: "basic",
+      include_answer: false,
+      include_images: false,
+    }),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Tavily search failed: ${resp.status} ${text}`);
+  }
+
+  const json = await resp.json();
+  const results = (json?.results ?? []) as any[];
+
+  return results
+    .map((r) => ({
+      title: String(r?.title || "").slice(0, 200),
+      url: String(r?.url || ""),
+      snippet: String(r?.content || r?.snippet || "").slice(0, 700),
+    }))
+    .filter((r) => r.url);
+}
+
 export const handler: Handler = async () => {
   try {
-    console.log("SUM_BG start (summarize up to 2 episodes)");
+    console.log("SUM_BG start (summarize up to 2 episodes with Tavily)");
 
     if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
     const openaiKey = process.env.OPENAI_API_KEY;
@@ -86,10 +125,35 @@ export const handler: Handler = async () => {
       try {
         const transcript: string = ep.transcript;
 
-        // Keep prompt size sane
         const head = transcript.slice(0, 18000);
         const tail = transcript.length > 22000 ? transcript.slice(-4000) : "";
         const transcriptForModel = tail ? `${head}\n\n[...]\n\n${tail}` : head;
+
+        // Retrieval query: lightweight + effective
+        const retrievalQuery = `${ep.title} AI Daily Brief`;
+        console.log("SUM_BG tavily search", { id, retrievalQuery });
+
+        let sources: WebSource[] = [];
+        try {
+          sources = await tavilySearch(retrievalQuery, 5);
+        } catch (tErr: any) {
+          // Don't fail summarization if retrieval fails; proceed transcript-only
+          console.log("SUM_BG tavily failed (continuing transcript-only)", {
+            id,
+            msg: String(tErr?.message || tErr).slice(0, 400),
+          });
+          sources = [];
+        }
+
+        const sourcesText =
+          sources.length === 0
+            ? "(No external sources available.)"
+            : sources
+                .map(
+                  (s, i) =>
+                    `(${i + 1}) ${s.title}\n${s.url}\n${(s.snippet || "").trim().slice(0, 500)}`
+                )
+                .join("\n\n");
 
         const system = `
 You are a senior AI analyst producing a detailed daily brief from a podcast transcript.
@@ -97,9 +161,11 @@ You are a senior AI analyst producing a detailed daily brief from a podcast tran
 Goal: help the reader understand the topic well enough to discuss it intelligently.
 
 Primary source: the transcript. Use it to ground claims.
-You MAY add helpful background context and explanations that are widely known, but:
-- Do not invent specific new events, quotes, numbers, or “recent reports” not present in the transcript.
-- If you add context beyond the transcript, keep it general (no precise claims that require browsing).
+You will also receive external web context snippets with URLs. Use them to add detail and background.
+Rules for web context:
+- Prefer transcript if there is any conflict.
+- Do not invent facts not supported by the transcript or the provided web snippets.
+- Avoid phrasing like “according to recent reports” unless the snippet clearly supports it.
 - If something is uncertain, frame it as interpretation ("This suggests...", "A common implication is...").
 
 Tone:
@@ -113,6 +179,7 @@ Return ONLY valid JSON with the exact schema requested.
           `Episode title: ${ep.title}\n` +
           `Published date: ${ep.published_date}\n\n` +
           `Transcript:\n${transcriptForModel}\n\n` +
+          `External web context (snippets + URLs):\n${sourcesText}\n\n` +
           `Return ONLY valid JSON with this exact shape:\n` +
           `{\n` +
           `  "one_sentence_summary": string,\n` +
@@ -144,12 +211,12 @@ Return ONLY valid JSON with the exact schema requested.
 
         const { error: updateErr } = await supabaseAdmin
           .from("episodes")
-          .update({ highlights, highlights_error: null })
+          .update({ highlights, sources, highlights_error: null })
           .eq("id", id);
 
         if (updateErr) throw new Error(`Update highlights failed: ${updateErr.message}`);
 
-        console.log("SUM_BG saved highlights", { id });
+        console.log("SUM_BG saved highlights + sources", { id, sources: sources.length });
       } catch (inner: any) {
         const msg = String(inner?.message || inner).slice(0, 800);
         console.log("SUM_BG failed episode", { id, msg });
