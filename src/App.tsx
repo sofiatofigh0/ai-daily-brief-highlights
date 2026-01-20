@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { supabase } from "./lib/supabaseClient";
+import Calendar from "./Calendar";
 
 type Highlights = {
   one_sentence_summary: string;
@@ -89,29 +90,35 @@ export default function App() {
         <p className="subtitle">Latest by default. Select a date to view past highlights.</p>
 
         <div className="controls">
-          <label className="label" htmlFor="dateSelect">
-            Date
-          </label>
+          <Calendar
+            availableDates={dateOptions}
+            selectedDate={selectedDate}
+            onDateSelect={setSelectedDate}
+            disabled={loading}
+          />
 
-          <select
-            id="dateSelect"
-            className="select"
-            value={selectedDate}
-            onChange={(e) => setSelectedDate(e.target.value)}
-            disabled={loading || dateOptions.length === 0}
-          >
-            {dateOptions.length === 0 ? (
-              <option value="">No episodes yet</option>
-            ) : (
-              dateOptions.map((d) => (
-                <option key={d} value={d}>
-                  {d}
-                </option>
-              ))
-            )}
-          </select>
-
-          <button className="button" onClick={loadEpisodes} disabled={loading}>
+          <button className="refresh-button" onClick={loadEpisodes} disabled={loading}>
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 16 16"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+            >
+              <path
+                d="M14 8C14 11.3137 11.3137 14 8 14C4.68629 14 2 11.3137 2 8C2 4.68629 4.68629 2 8 2C9.84566 2 11.4922 2.85839 12.5715 4.20991"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+              />
+              <path
+                d="M14 4L12 6L10 4"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
             Refresh
           </button>
         </div>
