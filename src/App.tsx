@@ -1,3 +1,4 @@
+// src/App.tsx
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 import { supabase } from "./lib/supabaseClient";
@@ -5,9 +6,11 @@ import Calendar from "./Calendar";
 
 type Highlights = {
   one_sentence_summary: string;
+  what_changed?: string;
+  why_it_matters_now?: string;
+  who_should_care?: string;
   top_takeaways: string[];
   stories: { headline: string; why_it_matters: string }[];
-  action_items?: string[];
 };
 
 type EpisodeRow = {
@@ -42,7 +45,6 @@ export default function App() {
     const rows = (data ?? []) as EpisodeRow[];
     setEpisodes(rows);
 
-    // Default to latest date (even if highlights are null)
     if (rows.length > 0) {
       const latestDate = rows[0]?.published_date;
       if (!selectedDate && latestDate) setSelectedDate(latestDate);
@@ -64,24 +66,18 @@ export default function App() {
     return Array.from(set).sort((a, b) => (a < b ? 1 : -1));
   }, [episodes]);
 
-  // Pick the newest episode for the selected date.
-  // This avoids "blank" issues when multiple episodes share a date.
   const selectedEpisode = useMemo(() => {
     if (!episodes.length) return null;
 
     const date = selectedDate || episodes[0].published_date;
-
     const matches = episodes.filter((e) => e.published_date === date);
 
-    if (matches.length > 0) {
-      // episodes already sorted newest-first by published_at from the query,
-      // so matches[0] is the newest episode on that date.
-      return matches[0];
-    }
-
-    // Fallback to most recent overall
+    if (matches.length > 0) return matches[0];
     return episodes[0];
   }, [episodes, selectedDate]);
+
+  const hasNewFormat = (h: Highlights) =>
+    Boolean(h.what_changed?.trim() || h.why_it_matters_now?.trim() || h.who_should_care?.trim());
 
   return (
     <div className="page">
@@ -145,13 +141,10 @@ export default function App() {
               <div className="episodeMeta">
                 <span>{selectedEpisode.published_date}</span>
                 <span style={{ opacity: 0.6 }}>•</span>
-                <span style={{ opacity: 0.8 }}>
-                  {new Date(selectedEpisode.published_at).toLocaleString()}
-                </span>
+                <span style={{ opacity: 0.8 }}>{new Date(selectedEpisode.published_at).toLocaleString()}</span>
               </div>
             </div>
 
-            {/* Bulletproof null check: never touch highlights fields if null */}
             {!selectedEpisode.highlights ? (
               <div className="processing">
                 <div style={{ fontWeight: 600, marginBottom: 8 }}>Highlights are processing…</div>
@@ -166,6 +159,29 @@ export default function App() {
                   <div className="sectionTitle">One-sentence summary</div>
                   <div style={{ opacity: 0.9 }}>{selectedEpisode.highlights.one_sentence_summary}</div>
                 </div>
+
+                {hasNewFormat(selectedEpisode.highlights) ? (
+                  <div className="section">
+                    <div className="sectionTitle">What changed</div>
+                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
+                      {selectedEpisode.highlights.what_changed || "—"}
+                    </div>
+
+                    <div className="sectionTitle" style={{ marginTop: 16 }}>
+                      Why it matters now
+                    </div>
+                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
+                      {selectedEpisode.highlights.why_it_matters_now || "—"}
+                    </div>
+
+                    <div className="sectionTitle" style={{ marginTop: 16 }}>
+                      Who should care
+                    </div>
+                    <div style={{ opacity: 0.9, whiteSpace: "pre-wrap" }}>
+                      {selectedEpisode.highlights.who_should_care || "—"}
+                    </div>
+                  </div>
+                ) : null}
 
                 <div className="section">
                   <div className="sectionTitle">Top takeaways</div>
@@ -188,14 +204,10 @@ export default function App() {
                   </div>
                 </div>
 
-                {selectedEpisode.highlights.action_items?.length ? (
-                  <div className="section">
-                    <div className="sectionTitle">Action items</div>
-                    <ul>
-                      {selectedEpisode.highlights.action_items.map((a, idx) => (
-                        <li key={idx}>{a}</li>
-                      ))}
-                    </ul>
+                {!hasNewFormat(selectedEpisode.highlights) ? (
+                  <div style={{ opacity: 0.6, marginTop: 12 }}>
+                    Note: this episode uses the older highlights format. Newer episodes will include “What changed / Why it
+                    matters now / Who should care.”
                   </div>
                 ) : null}
               </div>

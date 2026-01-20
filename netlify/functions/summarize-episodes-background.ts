@@ -1,12 +1,15 @@
+// netlify/functions/summarize-episodes-background.ts
 import type { Handler } from "@netlify/functions";
 import OpenAI from "openai";
 import { supabaseAdmin } from "./_supabase";
 
 type Highlights = {
   one_sentence_summary: string;
+  what_changed: string;
+  why_it_matters_now: string;
+  who_should_care: string;
   top_takeaways: string[];
   stories: { headline: string; why_it_matters: string }[];
-  action_items?: string[];
 };
 
 function isRealTranscript(t: any): boolean {
@@ -17,7 +20,6 @@ function isRealTranscript(t: any): boolean {
 }
 
 function safeJsonParse<T>(text: string): T {
-  // If the model returns extra text, try to grab the first JSON object
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) throw new Error("No JSON object found in model output");
@@ -27,11 +29,19 @@ function safeJsonParse<T>(text: string): T {
 
 function validateHighlights(h: any): Highlights {
   if (!h || typeof h !== "object") throw new Error("Highlights not an object");
-  if (typeof h.one_sentence_summary !== "string" || !h.one_sentence_summary.trim()) {
-    throw new Error("Missing one_sentence_summary");
-  }
-  if (!Array.isArray(h.top_takeaways) || h.top_takeaways.length < 3) {
-    throw new Error("top_takeaways must be an array with at least 3 items");
+
+  const reqStr = (k: keyof Highlights) => {
+    const v = (h as any)[k];
+    if (typeof v !== "string" || !v.trim()) throw new Error(`Missing ${String(k)}`);
+  };
+
+  reqStr("one_sentence_summary");
+  reqStr("what_changed");
+  reqStr("why_it_matters_now");
+  reqStr("who_should_care");
+
+  if (!Array.isArray(h.top_takeaways) || h.top_takeaways.length < 4) {
+    throw new Error("top_takeaways must be an array with at least 4 items");
   }
   if (!Array.isArray(h.stories) || h.stories.length < 2) {
     throw new Error("stories must be an array with at least 2 items");
@@ -42,8 +52,7 @@ function validateHighlights(h: any): Highlights {
       throw new Error("story missing headline/why_it_matters");
     }
   }
-  // Action items optional
-  if (h.action_items && !Array.isArray(h.action_items)) throw new Error("action_items must be an array if present");
+
   return h as Highlights;
 }
 
@@ -57,7 +66,6 @@ export const handler: Handler = async () => {
 
     const client = new OpenAI({ apiKey: openaiKey });
 
-    // 1) Fetch candidate episodes (recent first)
     const { data: rows, error } = await supabaseAdmin
       .from("episodes")
       .select("id,title,published_at,published_date,transcript,highlights")
@@ -78,15 +86,28 @@ export const handler: Handler = async () => {
       try {
         const transcript: string = ep.transcript;
 
-        // Keep prompt size sane: summarize from the first N chars + last M chars
-        // (Most episodes are short, but this protects us.)
+        // Keep prompt size sane
         const head = transcript.slice(0, 18000);
         const tail = transcript.length > 22000 ? transcript.slice(-4000) : "";
         const transcriptForModel = tail ? `${head}\n\n[...]\n\n${tail}` : head;
 
-        const system =
-          "You are a precise news editor. Convert the podcast transcript into structured highlights. " +
-          "Be factual to the transcript, avoid speculation, remove filler, keep phrasing crisp.";
+        const system = `
+You are a senior AI analyst producing a detailed daily brief from a podcast transcript.
+
+Goal: help the reader understand the topic well enough to discuss it intelligently.
+
+Primary source: the transcript. Use it to ground claims.
+You MAY add helpful background context and explanations that are widely known, but:
+- Do not invent specific new events, quotes, numbers, or “recent reports” not present in the transcript.
+- If you add context beyond the transcript, keep it general (no precise claims that require browsing).
+- If something is uncertain, frame it as interpretation ("This suggests...", "A common implication is...").
+
+Tone:
+- Analytical, clear, not hypey
+- More detailed than a generic summary
+
+Return ONLY valid JSON with the exact schema requested.
+        `.trim();
 
         const user =
           `Episode title: ${ep.title}\n` +
@@ -95,14 +116,16 @@ export const handler: Handler = async () => {
           `Return ONLY valid JSON with this exact shape:\n` +
           `{\n` +
           `  "one_sentence_summary": string,\n` +
-          `  "top_takeaways": string[] (5 items),\n` +
-          `  "stories": { "headline": string, "why_it_matters": string }[] (3 items),\n` +
-          `  "action_items": string[] (optional, 0-3 items)\n` +
+          `  "what_changed": string,\n` +
+          `  "why_it_matters_now": string,\n` +
+          `  "who_should_care": string,\n` +
+          `  "top_takeaways": string[] (4-7 items; can be multi-sentence if helpful),\n` +
+          `  "stories": { "headline": string, "why_it_matters": string }[] (3-5 items)\n` +
           `}\n` +
-          `Constraints:\n` +
-          `- one_sentence_summary: 1 sentence, no emojis\n` +
-          `- top_takeaways: short bullets, no more than ~14 words each\n` +
-          `- stories: each headline <= 10 words; why_it_matters 1-2 sentences\n`;
+          `Guidelines:\n` +
+          `- Make what_changed / why_it_matters_now / who_should_care substantive (2-5 sentences each).\n` +
+          `- top_takeaways should include enough detail to support conversation.\n` +
+          `- stories should cover different angles, not repeats.\n`;
 
         console.log("SUM_BG calling OpenAI", { id });
 
@@ -119,7 +142,6 @@ export const handler: Handler = async () => {
         const parsed = safeJsonParse<Highlights>(text);
         const highlights = validateHighlights(parsed);
 
-        // 2) Save highlights + clear any prior error
         const { error: updateErr } = await supabaseAdmin
           .from("episodes")
           .update({ highlights, highlights_error: null })
@@ -132,21 +154,14 @@ export const handler: Handler = async () => {
         const msg = String(inner?.message || inner).slice(0, 800);
         console.log("SUM_BG failed episode", { id, msg });
 
-        // Save error message (best effort)
-        await supabaseAdmin
-          .from("episodes")
-          .update({ highlights_error: msg })
-          .eq("id", id);
+        await supabaseAdmin.from("episodes").update({ highlights_error: msg }).eq("id", id);
       }
     }
 
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        status: "ok",
-        processed: candidates.length,
-      }),
+      body: JSON.stringify({ status: "ok", processed: candidates.length }),
     };
   } catch (e: any) {
     console.log("SUM_BG error", e?.message || e);
