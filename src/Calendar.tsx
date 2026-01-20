@@ -175,10 +175,7 @@ export default function Calendar({
             disabled={disabled || !dayInfo.isAvailable}
           >
             {dayInfo.day !== null && (
-              <>
-                <span className="calendar-day-number">{dayInfo.day}</span>
-                {dayInfo.isSelected && <span className="calendar-day-dot" />}
-              </>
+              <span className="calendar-day-number">{dayInfo.day}</span>
             )}
           </button>
         ))}
