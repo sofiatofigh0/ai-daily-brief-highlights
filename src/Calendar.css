@@ -114,15 +114,6 @@
 .calendar-day-number {
   position: relative;
   z-index: 1;
-  margin-bottom: 2px;
-}
-
-.calendar-day-dot {
-  width: 4px;
-  height: 4px;
-  border-radius: 50%;
-  background: #fff;
-  margin-top: 4px;
 }
 
 .calendar-day-available {
