@@ -22,4 +22,4 @@ const run: Handler = async () => {
 };
 
 // Runs daily at 23:30 UTC (adjust below if you want)
-export const handler = schedule("30 23 * * *", run);
+export const handler = schedule("0 21 * * *", run);
