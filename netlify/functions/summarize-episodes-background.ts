@@ -84,7 +84,7 @@ function buildSourcesText(sources: WebSource[]): string {
   if (!sources.length) return "(No external sources available.)";
 
   return sources
-    .slice(0, 8)
+    .slice(0, 3) // cap context too
     .map((s, i) => {
       const title = (s.title || "").trim().slice(0, 200) || "Untitled";
       const url = (s.url || "").trim();
@@ -94,7 +94,7 @@ function buildSourcesText(sources: WebSource[]): string {
     .join("\n\n");
 }
 
-function dedupeSources(sources: WebSource[], cap = 8): WebSource[] {
+function dedupeSources(sources: WebSource[], cap = 3): WebSource[] {
   const seen = new Set<string>();
   const out: WebSource[] = [];
 
@@ -102,14 +102,88 @@ function dedupeSources(sources: WebSource[], cap = 8): WebSource[] {
     const url = (s.url || "").trim();
     if (!url || seen.has(url)) continue;
     seen.add(url);
-    out.push(s);
+    out.push({ title: s.title, url, snippet: s.snippet });
     if (out.length >= cap) break;
   }
 
   return out;
 }
 
-async function tavilySearch(query: string, maxResults = 5): Promise<WebSource[]> {
+/**
+ * Retrieval policy:
+ * - Prefer credible news/blog/research/video sources
+ * - Avoid social networks and podcast hosts/directories
+ */
+const TAVILY_EXCLUDE_DOMAINS = [
+  // social
+  "facebook.com",
+  "fb.com",
+  "instagram.com",
+  "threads.net",
+  "tiktok.com",
+  "x.com",
+  "twitter.com",
+  "linkedin.com",
+  "reddit.com",
+
+  // podcast hosts/directories (avoid “referring back to the podcast”)
+  "anchor.fm",
+  "spotify.com",
+  "open.spotify.com",
+  "podcasts.apple.com",
+  "player.fm",
+  "listennotes.com",
+  "podbean.com",
+  "buzzsprout.com",
+  "captivate.fm",
+  "simplecast.com",
+  "transistor.fm",
+  "audacy.com",
+  "iheartradio.com",
+];
+
+const TAVILY_INCLUDE_DOMAINS = [
+  // research/papers
+  "arxiv.org",
+  "openreview.net",
+  "paperswithcode.com",
+
+  // reputable news/tech/business
+  "reuters.com",
+  "apnews.com",
+  "bbc.com",
+  "ft.com",
+  "wsj.com",
+  "bloomberg.com",
+  "theverge.com",
+  "techcrunch.com",
+  "wired.com",
+  "venturebeat.com",
+
+  // company blogs/docs (high-signal)
+  "openai.com",
+  "anthropic.com",
+  "deepmind.google",
+  "ai.googleblog.com",
+  "googleblog.com",
+  "microsoft.com",
+  "azure.microsoft.com",
+  "aws.amazon.com",
+  "nvidia.com",
+
+  // non-social video
+  "youtube.com",
+];
+
+function hostFromUrl(u: string): string {
+  try {
+    return new URL(u).hostname.toLowerCase().replace(/^www\./, "");
+  } catch {
+    return "";
+  }
+}
+
+async function tavilySearch(query: string, maxResults = 3): Promise<WebSource[]> {
   const apiKey = process.env.TAVILY_API_KEY;
   if (!apiKey) throw new Error("Missing TAVILY_API_KEY");
 
@@ -120,10 +194,12 @@ async function tavilySearch(query: string, maxResults = 5): Promise<WebSource[]>
       api_key: apiKey,
       query,
       max_results: maxResults,
-      search_depth: "basic",
+      search_depth: "advanced",
       include_answer: false,
       include_images: false,
       include_raw_content: false,
+      include_domains: TAVILY_INCLUDE_DOMAINS,
+      exclude_domains: TAVILY_EXCLUDE_DOMAINS,
     }),
   });
 
@@ -135,13 +211,22 @@ async function tavilySearch(query: string, maxResults = 5): Promise<WebSource[]>
   const json: any = await resp.json();
   const results = Array.isArray(json?.results) ? json.results : [];
 
+  // hard-filter, in case Tavily still returns excluded domains
+  const blocked = new Set(TAVILY_EXCLUDE_DOMAINS.map((d) => d.toLowerCase()));
+
   return results
     .map((r: any) => ({
       title: String(r?.title || "").slice(0, 200),
       url: String(r?.url || ""),
       snippet: String(r?.content || r?.snippet || "").slice(0, 700),
     }))
-    .filter((r: WebSource) => r.url);
+    .filter((r: WebSource) => {
+      if (!r.url) return false;
+      const host = hostFromUrl(r.url);
+      if (!host) return false;
+      if (blocked.has(host)) return false;
+      return true;
+    });
 }
 
 /* ------------------------- handler ------------------------- */
@@ -191,10 +276,17 @@ export const handler: Handler = async () => {
         const needSources = isEmptySources(ep.sources);
 
         if (needSources) {
-          const query = `${ep.title} ${ep.published_date}`;
+          // UPDATED QUERY:
+          // - strongly nudges toward credible sources
+          // - avoids “podcast” pages + directories
+          const query =
+            `${ep.title} ${ep.published_date} ` +
+            `(news OR blog OR paper OR report OR arxiv OR announcement OR press release OR YouTube) ` +
+            `-podcast -spotify -anchor -apple -facebook -instagram -twitter -x.com -reddit -linkedin`;
+
           try {
-            const raw = await tavilySearch(query, 5);
-            sources = dedupeSources(raw, 8);
+            const raw = await tavilySearch(query, 3);     // <= cap at 3
+            sources = dedupeSources(raw, 3);              // <= keep only 3
           } catch (e: any) {
             console.log("TAVILY failed", String(e?.message || e).slice(0, 200));
             sources = [];
@@ -266,7 +358,6 @@ Return ONLY valid JSON with the exact schema requested.
       } catch (inner: any) {
         const msg = String(inner?.message || inner).slice(0, 800);
         console.log("SUM_BG failed", { id, msg });
-
         await supabaseAdmin.from("episodes").update({ highlights_error: msg }).eq("id", id);
       }
     }

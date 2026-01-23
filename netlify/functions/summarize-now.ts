@@ -36,8 +36,7 @@ function safeJsonParse<T>(text: string): T {
   const start = text.indexOf("{");
   const end = text.lastIndexOf("}");
   if (start === -1 || end === -1 || end <= start) throw new Error("No JSON object found in model output");
-  const slice = text.slice(start, end + 1);
-  return JSON.parse(slice) as T;
+  return JSON.parse(text.slice(start, end + 1)) as T;
 }
 
 function validateHighlights(h: any): Highlights {
@@ -71,7 +70,7 @@ function validateHighlights(h: any): Highlights {
 function buildSourcesText(sources: WebSource[]): string {
   if (!sources.length) return "(No external sources available.)";
   return sources
-    .slice(0, 8)
+    .slice(0, 3)
     .map((s, i) => {
       const title = (s.title || "").trim().slice(0, 200) || "Untitled";
       const url = (s.url || "").trim();
@@ -81,7 +80,7 @@ function buildSourcesText(sources: WebSource[]): string {
     .join("\n\n");
 }
 
-function dedupeSources(sources: WebSource[], cap = 8): WebSource[] {
+function dedupeSources(sources: WebSource[], cap = 3): WebSource[] {
   const seen = new Set<string>();
   const out: WebSource[] = [];
   for (const s of sources) {
@@ -94,7 +93,77 @@ function dedupeSources(sources: WebSource[], cap = 8): WebSource[] {
   return out;
 }
 
-async function tavilySearch(query: string, maxResults = 5): Promise<WebSource[]> {
+/**
+ * Retrieval policy:
+ * - Prefer credible news/blog/research/video sources
+ * - Avoid social networks and podcast hosts
+ */
+const TAVILY_EXCLUDE_DOMAINS = [
+  "facebook.com",
+  "fb.com",
+  "instagram.com",
+  "threads.net",
+  "tiktok.com",
+  "x.com",
+  "twitter.com",
+  "linkedin.com",
+  "reddit.com",
+
+  // podcast hosting / directories (avoid “referring back to the podcast”)
+  "anchor.fm",
+  "spotify.com",
+  "open.spotify.com",
+  "podcasts.apple.com",
+  "apple.com",
+  "listennotes.com",
+  "player.fm",
+  "podbean.com",
+  "buzzsprout.com",
+  "captivate.fm",
+  "simplecast.com",
+  "transistor.fm",
+  "audacy.com",
+  "iheartradio.com",
+];
+
+const TAVILY_INCLUDE_DOMAINS = [
+  // research + papers
+  "arxiv.org",
+  "openreview.net",
+  "paperswithcode.com",
+
+  // reputable tech / business news
+  "reuters.com",
+  "apnews.com",
+  "bbc.com",
+  "ft.com",
+  "wsj.com",
+  "bloomberg.com",
+  "theverge.com",
+  "techcrunch.com",
+  "wired.com",
+  "venturebeat.com",
+
+  // company blogs / docs (high-signal)
+  "openai.com",
+  "anthropic.com",
+  "deepmind.google",
+  "ai.googleblog.com",
+  "googleblog.com",
+  "microsoft.com",
+  "azure.microsoft.com",
+  "aws.amazon.com",
+  "nvidia.com",
+
+  // video (non-social)
+  "youtube.com",
+];
+
+/**
+ * NOTE: Tavily fields vary by plan, but include_domains/exclude_domains are commonly supported.
+ * If Tavily ignores these, we still hard-filter results below.
+ */
+async function tavilySearch(query: string, maxResults = 3): Promise<WebSource[]> {
   const key = process.env.TAVILY_API_KEY;
   if (!key) throw new Error("Missing TAVILY_API_KEY");
 
@@ -105,10 +174,12 @@ async function tavilySearch(query: string, maxResults = 5): Promise<WebSource[]>
       api_key: key,
       query,
       max_results: maxResults,
-      search_depth: "basic",
+      search_depth: "advanced",
       include_answer: false,
       include_images: false,
       include_raw_content: false,
+      include_domains: TAVILY_INCLUDE_DOMAINS,
+      exclude_domains: TAVILY_EXCLUDE_DOMAINS,
     }),
   });
 
@@ -120,13 +191,26 @@ async function tavilySearch(query: string, maxResults = 5): Promise<WebSource[]>
   const json: any = await resp.json();
   const results = Array.isArray(json?.results) ? json.results : [];
 
+  // hard-filter, in case Tavily still returns excluded domains
+  const blocked = new Set(TAVILY_EXCLUDE_DOMAINS.map((d) => d.toLowerCase()));
+
   return results
     .map((r: any) => ({
       title: String(r?.title || "").slice(0, 200),
       url: String(r?.url || ""),
       snippet: String(r?.content || r?.snippet || "").slice(0, 700),
     }))
-    .filter((r: WebSource) => r.url);
+    .filter((r: WebSource) => {
+      if (!r.url) return false;
+      try {
+        const host = new URL(r.url).hostname.toLowerCase().replace(/^www\./, "");
+        if (blocked.has(host)) return false;
+      } catch {
+        // if URL parsing fails, drop it
+        return false;
+      }
+      return true;
+    });
 }
 
 export const handler: Handler = async () => {
@@ -145,18 +229,10 @@ export const handler: Handler = async () => {
 
     if (error) return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
 
-    const all = rows || [];
-
-    // Candidate rule (fixed):
-    // - Must have a real transcript
-    // - Must be missing highlights (NULL or {})
-    //   OR missing sources (NULL or [])
-    const candidates = all.filter((r: any) => {
+    const candidates = (rows || []).filter((r: any) => {
       if (!isRealTranscript(r.transcript)) return false;
-
       const missingHighlights = r.highlights == null || isEmptyObject(r.highlights);
       const missingSources = isEmptySources(r.sources);
-
       return missingHighlights || missingSources;
     });
 
@@ -179,27 +255,26 @@ export const handler: Handler = async () => {
     const tail = transcript.length > 22000 ? transcript.slice(-4000) : "";
     const transcriptForModel = tail ? `${head}\n\n[...]\n\n${tail}` : head;
 
-    // 1) Retrieval: only fetch if sources missing
+    // Backfill sources if missing
     let sources: WebSource[] = Array.isArray(ep.sources) ? (ep.sources as WebSource[]) : [];
     const needSources = isEmptySources(ep.sources);
 
     if (needSources) {
-      // Minimal improvement: include title + date (helps relevance), avoid podcast name bias
-      const retrievalQuery = `${ep.title} ${ep.published_date}`;
+      // Better query: explicitly target articles/papers/blog posts/videos, NOT the podcast
+      const retrievalQuery = `${ep.title} ${ep.published_date} (news OR blog OR paper OR report OR arxiv OR announcement OR press release OR YouTube) -podcast -spotify -anchor -apple`;
+
       try {
-        const raw = await tavilySearch(retrievalQuery, 5);
-        sources = dedupeSources(raw, 8);
+        const raw = await tavilySearch(retrievalQuery, 3);
+        sources = dedupeSources(raw, 3);
       } catch (e: any) {
-        // Don't fail the whole run if retrieval fails
-        sources = [];
         console.log("TAVILY failed", String(e?.message || e).slice(0, 200));
+        sources = [];
       }
 
       const { error: srcErr } = await supabaseAdmin.from("episodes").update({ sources }).eq("id", ep.id);
       if (srcErr) throw new Error(`Update sources failed: ${srcErr.message}`);
     }
 
-    // 2) Summarize: only if highlights missing (NULL or {})
     const needHighlights = ep.highlights == null || isEmptyObject(ep.highlights);
 
     if (!needHighlights) {
@@ -266,18 +341,12 @@ Return ONLY valid JSON with the exact schema requested.
       .update({ highlights, highlights_error: null })
       .eq("id", ep.id);
 
-    if (updateErr) {
-      return { statusCode: 500, body: JSON.stringify({ error: "Update failed", details: updateErr }) };
-    }
+    if (updateErr) return { statusCode: 500, body: JSON.stringify({ error: "Update failed", details: updateErr }) };
 
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(
-        { ok: true, updated_id: ep.id, title: ep.title, sources_count: sources.length, highlights },
-        null,
-        2
-      ),
+      body: JSON.stringify({ ok: true, updated_id: ep.id, title: ep.title, sources_count: sources.length, sources, highlights }, null, 2),
     };
   } catch (e: any) {
     return { statusCode: 500, body: JSON.stringify({ error: e?.message || "Unknown error" }) };
