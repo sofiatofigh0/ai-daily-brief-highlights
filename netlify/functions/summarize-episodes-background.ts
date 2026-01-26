@@ -1,7 +1,12 @@
 // netlify/functions/summarize-episodes-background.ts
-import type { Handler } from "@netlify/functions";
+import type { Handler, HandlerEvent } from "@netlify/functions";
 import OpenAI from "openai";
 import { supabaseAdmin } from "./_supabase";
+
+/* -------------------- config -------------------- */
+
+const MAX_BACKFILL_DEPTH = 15; // Max self-chain iterations to prevent runaway
+const EPISODES_PER_RUN = 2;   // How many summarizations per run
 
 type WebSource = {
   title: string;
@@ -231,9 +236,12 @@ async function tavilySearch(query: string, maxResults = 3): Promise<WebSource[]>
 
 /* ------------------------- handler ------------------------- */
 
-export const handler: Handler = async () => {
+export const handler: Handler = async (event: HandlerEvent) => {
+  // Parse depth from query params (for backfill chaining)
+  const depth = parseInt(event.queryStringParameters?.depth || "0", 10);
+
   try {
-    console.log("SUM_BG start (up to 2 episodes)");
+    console.log(`SUM_BG start (depth=${depth}, up to ${EPISODES_PER_RUN} episodes)`);
 
     if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
     const openaiKey = process.env.OPENAI_API_KEY;
@@ -249,14 +257,15 @@ export const handler: Handler = async () => {
 
     if (error) throw new Error(`Fetch episodes failed: ${error.message}`);
 
-    const candidates = (rows || [])
+    const allCandidates = (rows || [])
       .filter((r: any) => {
         if (!isRealTranscript(r.transcript)) return false;
         const missingHighlights = r.highlights == null || isEmptyObject(r.highlights);
         const missingSources = isEmptySources(r.sources);
         return missingHighlights || missingSources;
-      })
-      .slice(0, 2);
+      });
+
+    const candidates = allCandidates.slice(0, EPISODES_PER_RUN);
 
     console.log("SUM_BG candidates", candidates.map((c: any) => c.id));
 
@@ -362,10 +371,38 @@ Return ONLY valid JSON with the exact schema requested.
       }
     }
 
+    // Check if there are more unprocessed episodes (backfill needed)
+    const remainingCandidates = allCandidates.length - candidates.length;
+    let chainTriggered = false;
+
+    if (remainingCandidates > 0 && depth < MAX_BACKFILL_DEPTH) {
+      // Trigger another run to continue backfill
+      const base = process.env.URL || process.env.DEPLOY_PRIME_URL || process.env.DEPLOY_URL;
+      if (base) {
+        const nextDepth = depth + 1;
+        const nextUrl = `${base}/.netlify/functions/summarize-episodes-background?depth=${nextDepth}`;
+        console.log(`SUM_BG triggering backfill chain (depth=${nextDepth}, remaining=${remainingCandidates})`);
+
+        // Fire-and-forget next run
+        fetch(nextUrl).catch((e) =>
+          console.log("SUM_BG chain trigger failed", e?.message || e)
+        );
+        chainTriggered = true;
+      }
+    } else if (remainingCandidates > 0) {
+      console.log(`SUM_BG backfill max depth reached (${MAX_BACKFILL_DEPTH}), ${remainingCandidates} episodes still pending`);
+    }
+
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: "ok", processed }, null, 2),
+      body: JSON.stringify({
+        status: "ok",
+        depth,
+        processed,
+        remaining_candidates: remainingCandidates,
+        chain_triggered: chainTriggered,
+      }, null, 2),
     };
   } catch (e: any) {
     console.log("SUM_BG error", e?.message || e);
