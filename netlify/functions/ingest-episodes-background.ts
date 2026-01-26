@@ -1,6 +1,11 @@
-import type { Handler } from "@netlify/functions";
+import type { Handler, HandlerEvent } from "@netlify/functions";
 import { supabaseAdmin } from "./_supabase";
 import { XMLParser } from "fast-xml-parser";
+
+/* -------------------- config -------------------- */
+
+const MAX_BACKFILL_DEPTH = 10; // Max self-chain iterations to prevent runaway
+const EPISODES_PER_RUN = 2;   // How many transcriptions per run
 
 /* -------------------- helpers -------------------- */
 
@@ -89,9 +94,12 @@ function isRealTranscript(t: any): boolean {
 
 /* -------------------- handler -------------------- */
 
-export const handler: Handler = async () => {
+export const handler: Handler = async (event: HandlerEvent) => {
+  // Parse depth from query params (for backfill chaining)
+  const depth = parseInt(event.queryStringParameters?.depth || "0", 10);
+
   try {
-    console.log("INGEST_BG start (backfill 7 + transcribe up to 2 missing)");
+    console.log(`INGEST_BG start (depth=${depth}, backfill 7 + transcribe up to ${EPISODES_PER_RUN} missing)`);
 
     if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
 
@@ -164,7 +172,7 @@ export const handler: Handler = async () => {
     if (fetchErr) throw new Error(`Fetch upserted rows failed: ${fetchErr.message}`);
 
     const candidates = (rows || []).filter((r: any) => !isRealTranscript(r.transcript));
-    const toProcess = candidates.slice(0, 2);
+    const toProcess = candidates.slice(0, EPISODES_PER_RUN);
 
     console.log("INGEST_BG transcript candidates", {
       total_candidates: candidates.length,
@@ -216,13 +224,38 @@ export const handler: Handler = async () => {
       }
     }
 
+    // Check if there are more unprocessed episodes (backfill needed)
+    const remainingCandidates = candidates.length - toProcess.length;
+    let chainTriggered = false;
+
+    if (remainingCandidates > 0 && depth < MAX_BACKFILL_DEPTH) {
+      // Trigger another run to continue backfill
+      const base = process.env.URL || process.env.DEPLOY_PRIME_URL || process.env.DEPLOY_URL;
+      if (base) {
+        const nextDepth = depth + 1;
+        const nextUrl = `${base}/.netlify/functions/ingest-episodes-background?depth=${nextDepth}`;
+        console.log(`INGEST_BG triggering backfill chain (depth=${nextDepth}, remaining=${remainingCandidates})`);
+
+        // Fire-and-forget next run
+        fetch(nextUrl).catch((e) =>
+          console.log("INGEST_BG chain trigger failed", e?.message || e)
+        );
+        chainTriggered = true;
+      }
+    } else if (remainingCandidates > 0) {
+      console.log(`INGEST_BG backfill max depth reached (${MAX_BACKFILL_DEPTH}), ${remainingCandidates} episodes still pending`);
+    }
+
     return {
       statusCode: 200,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         status: "ok",
+        depth,
         ingested_count: cleanedRows.length,
         transcribed_this_run: toProcess.length,
+        remaining_candidates: remainingCandidates,
+        chain_triggered: chainTriggered,
       }),
     };
   } catch (e: any) {
