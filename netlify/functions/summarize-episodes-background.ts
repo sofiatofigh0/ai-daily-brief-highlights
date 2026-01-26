@@ -89,7 +89,7 @@ function buildSourcesText(sources: WebSource[]): string {
   if (!sources.length) return "(No external sources available.)";
 
   return sources
-    .slice(0, 3) // cap context too
+    .slice(0, 5) // allow up to 5 sources for richer context
     .map((s, i) => {
       const title = (s.title || "").trim().slice(0, 200) || "Untitled";
       const url = (s.url || "").trim();
@@ -185,6 +185,65 @@ function hostFromUrl(u: string): string {
     return new URL(u).hostname.toLowerCase().replace(/^www\./, "");
   } catch {
     return "";
+  }
+}
+
+/**
+ * Extract searchable topics from transcript using LLM.
+ * Returns 3-4 specific, concrete search queries based on actual content.
+ */
+async function extractSearchTopics(
+  client: OpenAI,
+  transcript: string,
+  title: string
+): Promise<string[]> {
+  const excerpt = transcript.slice(0, 10000); // Use first ~10k chars for extraction
+
+  const prompt = `Analyze this podcast transcript and extract 3-4 specific, searchable topics.
+
+For each topic, create a short search query (5-10 words) that would find relevant news articles, blog posts, or research papers.
+
+Focus on:
+- Specific company announcements or product launches mentioned
+- Named research papers or studies discussed
+- Specific people and what they said/did
+- Concrete claims or statistics that could be verified
+
+Do NOT include:
+- Generic topics like "AI news" or "technology trends"
+- The podcast name or host
+- Vague summaries
+
+Episode title: ${title}
+
+Transcript excerpt:
+${excerpt}
+
+Return ONLY a JSON array of 3-4 search query strings. Example:
+["OpenAI GPT-5 release announcement 2024", "Anthropic Claude 3 safety research paper", "Sam Altman interview Davos AI regulation"]`;
+
+  try {
+    const resp = await client.chat.completions.create({
+      model: "gpt-4o-mini",
+      temperature: 0,
+      messages: [{ role: "user", content: prompt }],
+    });
+
+    const text = resp.choices?.[0]?.message?.content ?? "[]";
+    // Extract JSON array from response
+    const start = text.indexOf("[");
+    const end = text.lastIndexOf("]");
+    if (start === -1 || end === -1) return [];
+
+    const parsed = JSON.parse(text.slice(start, end + 1));
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter((t: any) => typeof t === "string" && t.trim().length > 0)
+      .slice(0, 4);
+  } catch (e: any) {
+    console.log("Topic extraction failed", e?.message || e);
+    return [];
   }
 }
 
@@ -285,21 +344,39 @@ export const handler: Handler = async (event: HandlerEvent) => {
         const needSources = isEmptySources(ep.sources);
 
         if (needSources) {
-          // UPDATED QUERY:
-          // - strongly nudges toward credible sources
-          // - avoids “podcast” pages + directories
-          const query =
-            `${ep.title} ${ep.published_date} ` +
-            `(news OR blog OR paper OR report OR arxiv OR announcement OR press release OR YouTube) ` +
-            `-podcast -spotify -anchor -apple -facebook -instagram -twitter -x.com -reddit -linkedin`;
+          // Extract specific searchable topics from transcript
+          const topics = await extractSearchTopics(client, transcript, ep.title);
+          console.log("SUM_BG extracted topics", { id, topics });
 
-          try {
-            const raw = await tavilySearch(query, 3);     // <= cap at 3
-            sources = dedupeSources(raw, 3);              // <= keep only 3
-          } catch (e: any) {
-            console.log("TAVILY failed", String(e?.message || e).slice(0, 200));
-            sources = [];
+          // Run parallel searches for each topic
+          let allResults: WebSource[] = [];
+
+          if (topics.length > 0) {
+            const searchPromises = topics.slice(0, 3).map((topic) =>
+              tavilySearch(topic, 2).catch((e: any) => {
+                console.log("TAVILY topic search failed", { topic, err: e?.message });
+                return [] as WebSource[];
+              })
+            );
+
+            const results = await Promise.all(searchPromises);
+            allResults = results.flat();
           }
+
+          // Fallback: if no topics extracted or no results, try title-based search
+          if (allResults.length === 0) {
+            console.log("SUM_BG falling back to title search", { id });
+            const fallbackQuery = `${ep.title} ${ep.published_date} AI news announcement`;
+            try {
+              allResults = await tavilySearch(fallbackQuery, 3);
+            } catch (e: any) {
+              console.log("TAVILY fallback failed", String(e?.message || e).slice(0, 200));
+            }
+          }
+
+          // Dedupe and cap at 5 sources (more variety from multiple topics)
+          sources = dedupeSources(allResults, 5);
+          console.log("SUM_BG sources found", { id, count: sources.length });
 
           const { error: srcErr } = await supabaseAdmin
             .from("episodes")
