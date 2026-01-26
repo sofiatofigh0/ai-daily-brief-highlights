@@ -296,11 +296,12 @@ async function tavilySearch(query: string, maxResults = 3): Promise<WebSource[]>
 /* ------------------------- handler ------------------------- */
 
 export const handler: Handler = async (event: HandlerEvent) => {
-  // Parse depth from query params (for backfill chaining)
+  // Parse query params
   const depth = parseInt(event.queryStringParameters?.depth || "0", 10);
+  const resetSources = event.queryStringParameters?.reset_sources === "true";
 
   try {
-    console.log(`SUM_BG start (depth=${depth}, up to ${EPISODES_PER_RUN} episodes)`);
+    console.log(`SUM_BG start (depth=${depth}, reset_sources=${resetSources}, up to ${EPISODES_PER_RUN} episodes)`);
 
     if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
     const openaiKey = process.env.OPENAI_API_KEY;
@@ -308,13 +309,39 @@ export const handler: Handler = async (event: HandlerEvent) => {
 
     const client = new OpenAI({ apiKey: openaiKey });
 
-    const { data: rows, error } = await supabaseAdmin
+    let { data: rows, error } = await supabaseAdmin
       .from("episodes")
       .select("id,title,published_at,published_date,transcript,highlights,sources,highlights_error")
       .order("published_at", { ascending: false })
       .limit(30);
 
     if (error) throw new Error(`Fetch episodes failed: ${error.message}`);
+
+    // If reset_sources=true, clear sources for all episodes so they get re-fetched
+    if (resetSources && depth === 0) {
+      const idsToReset = (rows || [])
+        .filter((r: any) => isRealTranscript(r.transcript) && !isEmptySources(r.sources))
+        .map((r: any) => r.id);
+
+      if (idsToReset.length > 0) {
+        console.log(`SUM_BG resetting sources for ${idsToReset.length} episodes`);
+        const { error: resetErr } = await supabaseAdmin
+          .from("episodes")
+          .update({ sources: null })
+          .in("id", idsToReset);
+
+        if (resetErr) console.log("SUM_BG reset sources error", resetErr.message);
+
+        // Re-fetch rows after reset
+        const { data: refreshedRows } = await supabaseAdmin
+          .from("episodes")
+          .select("id,title,published_at,published_date,transcript,highlights,sources,highlights_error")
+          .order("published_at", { ascending: false })
+          .limit(30);
+
+        if (refreshedRows) rows = refreshedRows;
+      }
+    }
 
     const allCandidates = (rows || [])
       .filter((r: any) => {
@@ -457,6 +484,7 @@ Return ONLY valid JSON with the exact schema requested.
       const base = process.env.URL || process.env.DEPLOY_PRIME_URL || process.env.DEPLOY_URL;
       if (base) {
         const nextDepth = depth + 1;
+        // Note: don't pass reset_sources on chained calls - only reset once at depth=0
         const nextUrl = `${base}/.netlify/functions/summarize-episodes-background?depth=${nextDepth}`;
         console.log(`SUM_BG triggering backfill chain (depth=${nextDepth}, remaining=${remainingCandidates})`);
 
