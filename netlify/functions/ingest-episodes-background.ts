@@ -6,6 +6,7 @@ import { XMLParser } from "fast-xml-parser";
 
 const MAX_BACKFILL_DEPTH = 10; // Max self-chain iterations to prevent runaway
 const EPISODES_PER_RUN = 2;   // How many transcriptions per run
+const RSS_ITEMS_TO_INGEST = 15; // Fetch more RSS items to catch missed days
 
 /* -------------------- helpers -------------------- */
 
@@ -119,7 +120,7 @@ export const handler: Handler = async (event: HandlerEvent) => {
     const list = Array.isArray(items) ? items : items ? [items] : [];
     if (!list.length) throw new Error("No RSS items found");
 
-    const itemsToIngest = list.slice(0, 7);
+    const itemsToIngest = list.slice(0, RSS_ITEMS_TO_INGEST);
     console.log(`INGEST_BG RSS total=${list.length}, ingesting=${itemsToIngest.length}`);
 
     // 2) Upsert latest 7 rows (no transcript/highlights required)
@@ -159,17 +160,16 @@ export const handler: Handler = async (event: HandlerEvent) => {
 
     console.log("INGEST_BG upserted rows", { count: cleanedRows.length });
 
-    // 3) Transcribe up to 2 rows (among the 7) that are missing a real transcript
-    // We read back the 7 rows we just upserted, newest-first by published_at.
-    const ids = cleanedRows.map((r) => r.id);
-
+    // 3) Transcribe episodes missing a real transcript
+    // Query ALL recent episodes from database (not just ones we upserted)
+    // This ensures we catch any missed days from previous failed runs
     const { data: rows, error: fetchErr } = await supabaseAdmin
       .from("episodes")
       .select("id, title, audio_url, transcript, published_at")
-      .in("id", ids)
-      .order("published_at", { ascending: false });
+      .order("published_at", { ascending: false })
+      .limit(30); // Check last 30 episodes for missing transcripts
 
-    if (fetchErr) throw new Error(`Fetch upserted rows failed: ${fetchErr.message}`);
+    if (fetchErr) throw new Error(`Fetch episodes failed: ${fetchErr.message}`);
 
     const candidates = (rows || []).filter((r: any) => !isRealTranscript(r.transcript));
     const toProcess = candidates.slice(0, EPISODES_PER_RUN);
