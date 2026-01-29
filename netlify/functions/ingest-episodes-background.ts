@@ -98,14 +98,36 @@ function isRealTranscript(t: any): boolean {
 export const handler: Handler = async (event: HandlerEvent) => {
   // Parse depth from query params (for backfill chaining)
   const depth = parseInt(event.queryStringParameters?.depth || "0", 10);
+  const resetStuck = event.queryStringParameters?.reset_stuck === "true";
 
   try {
-    console.log(`INGEST_BG start (depth=${depth}, backfill 7 + transcribe up to ${EPISODES_PER_RUN} missing)`);
+    console.log(`INGEST_BG start (depth=${depth}, reset_stuck=${resetStuck}, transcribe up to ${EPISODES_PER_RUN} missing)`);
 
     if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
 
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!openaiKey) throw new Error("Missing OPENAI_API_KEY");
+
+    // Reset stuck episodes if requested (clear __PROCESSING__ and __ERROR__ states)
+    if (resetStuck && depth === 0) {
+      const { data: stuckRows } = await supabaseAdmin
+        .from("episodes")
+        .select("id, transcript")
+        .or("transcript.eq.__PROCESSING_TRANSCRIPT__,transcript.like.__ERROR__%")
+        .limit(50);
+
+      if (stuckRows && stuckRows.length > 0) {
+        const stuckIds = stuckRows.map((r: any) => r.id);
+        console.log(`INGEST_BG resetting ${stuckIds.length} stuck episodes`, stuckIds);
+
+        const { error: resetErr } = await supabaseAdmin
+          .from("episodes")
+          .update({ transcript: null })
+          .in("id", stuckIds);
+
+        if (resetErr) console.log("INGEST_BG reset error", resetErr.message);
+      }
+    }
 
     // 1) Fetch RSS
     const rssUrl = "https://anchor.fm/s/f7cac464/podcast/rss";
