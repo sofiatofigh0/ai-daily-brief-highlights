@@ -9,3 +9,7 @@
 [[scheduled.functions]]
   name = "ingest-episodes-background"
   cron = "*/30 * * * *"
+
+[[scheduled.functions]]
+  name = "summarize-episodes-background"
+  cron = "20,50 * * * *"
