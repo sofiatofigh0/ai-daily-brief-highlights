@@ -299,9 +299,10 @@ export const handler: Handler = async (event: HandlerEvent) => {
   // Parse query params
   const depth = parseInt(event.queryStringParameters?.depth || "0", 10);
   const resetSources = event.queryStringParameters?.reset_sources === "true";
+  const resetAll = event.queryStringParameters?.reset_all === "true";
 
   try {
-    console.log(`SUM_BG start (depth=${depth}, reset_sources=${resetSources}, up to ${EPISODES_PER_RUN} episodes)`);
+    console.log(`SUM_BG start (depth=${depth}, reset_sources=${resetSources}, reset_all=${resetAll}, up to ${EPISODES_PER_RUN} episodes)`);
 
     if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
     const openaiKey = process.env.OPENAI_API_KEY;
@@ -317,20 +318,29 @@ export const handler: Handler = async (event: HandlerEvent) => {
 
     if (error) throw new Error(`Fetch episodes failed: ${error.message}`);
 
-    // If reset_sources=true, clear sources for all episodes so they get re-fetched
-    if (resetSources && depth === 0) {
+    // If reset_all=true, clear BOTH highlights and sources for episodes with transcripts
+    // If reset_sources=true, clear only sources
+    if ((resetSources || resetAll) && depth === 0) {
       const idsToReset = (rows || [])
-        .filter((r: any) => isRealTranscript(r.transcript) && !isEmptySources(r.sources))
+        .filter((r: any) => {
+          if (!isRealTranscript(r.transcript)) return false;
+          if (resetAll) return true; // Reset all episodes with transcripts
+          return !isEmptySources(r.sources); // reset_sources: only those with sources
+        })
         .map((r: any) => r.id);
 
       if (idsToReset.length > 0) {
-        console.log(`SUM_BG resetting sources for ${idsToReset.length} episodes`);
+        const updateFields = resetAll
+          ? { sources: null, highlights: null, highlights_error: null }
+          : { sources: null };
+
+        console.log(`SUM_BG resetting ${resetAll ? 'all' : 'sources'} for ${idsToReset.length} episodes`);
         const { error: resetErr } = await supabaseAdmin
           .from("episodes")
-          .update({ sources: null })
+          .update(updateFields)
           .in("id", idsToReset);
 
-        if (resetErr) console.log("SUM_BG reset sources error", resetErr.message);
+        if (resetErr) console.log("SUM_BG reset error", resetErr.message);
 
         // Re-fetch rows after reset
         const { data: refreshedRows } = await supabaseAdmin
