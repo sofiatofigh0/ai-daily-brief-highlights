@@ -98,14 +98,53 @@ function isRealTranscript(t: any): boolean {
 export const handler: Handler = async (event: HandlerEvent) => {
   // Parse depth from query params (for backfill chaining)
   const depth = parseInt(event.queryStringParameters?.depth || "0", 10);
+  const resetStuck = event.queryStringParameters?.reset_stuck === "true";
 
   try {
-    console.log(`INGEST_BG start (depth=${depth}, backfill 7 + transcribe up to ${EPISODES_PER_RUN} missing)`);
+    console.log(`INGEST_BG start (depth=${depth}, reset_stuck=${resetStuck}, transcribe up to ${EPISODES_PER_RUN} missing)`);
 
     if (!supabaseAdmin) throw new Error("Missing SUPABASE_SERVICE_ROLE_KEY");
 
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!openaiKey) throw new Error("Missing OPENAI_API_KEY");
+
+    // Always reset __PROCESSING_TRANSCRIPT__ episodes (if we're starting a new run, old process died)
+    // Only reset __ERROR__ episodes when reset_stuck=true (manual retry)
+    if (depth === 0) {
+      // Always clear processing markers - they indicate a dead process
+      const { data: processingRows } = await supabaseAdmin
+        .from("episodes")
+        .select("id")
+        .eq("transcript", "__PROCESSING_TRANSCRIPT__")
+        .limit(50);
+
+      if (processingRows && processingRows.length > 0) {
+        const processingIds = processingRows.map((r: any) => r.id);
+        console.log(`INGEST_BG clearing ${processingIds.length} stale processing markers`, processingIds);
+        await supabaseAdmin
+          .from("episodes")
+          .update({ transcript: null })
+          .in("id", processingIds);
+      }
+
+      // Only reset error states when explicitly requested
+      if (resetStuck) {
+        const { data: errorRows } = await supabaseAdmin
+          .from("episodes")
+          .select("id")
+          .like("transcript", "__ERROR__%")
+          .limit(50);
+
+        if (errorRows && errorRows.length > 0) {
+          const errorIds = errorRows.map((r: any) => r.id);
+          console.log(`INGEST_BG resetting ${errorIds.length} error episodes`, errorIds);
+          await supabaseAdmin
+            .from("episodes")
+            .update({ transcript: null })
+            .in("id", errorIds);
+        }
+      }
+    }
 
     // 1) Fetch RSS
     const rssUrl = "https://anchor.fm/s/f7cac464/podcast/rss";
