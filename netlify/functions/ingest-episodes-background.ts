@@ -108,24 +108,41 @@ export const handler: Handler = async (event: HandlerEvent) => {
     const openaiKey = process.env.OPENAI_API_KEY;
     if (!openaiKey) throw new Error("Missing OPENAI_API_KEY");
 
-    // Reset stuck episodes if requested (clear __PROCESSING__ and __ERROR__ states)
-    if (resetStuck && depth === 0) {
-      const { data: stuckRows } = await supabaseAdmin
+    // Always reset __PROCESSING_TRANSCRIPT__ episodes (if we're starting a new run, old process died)
+    // Only reset __ERROR__ episodes when reset_stuck=true (manual retry)
+    if (depth === 0) {
+      // Always clear processing markers - they indicate a dead process
+      const { data: processingRows } = await supabaseAdmin
         .from("episodes")
-        .select("id, transcript")
-        .or("transcript.eq.__PROCESSING_TRANSCRIPT__,transcript.like.__ERROR__%")
+        .select("id")
+        .eq("transcript", "__PROCESSING_TRANSCRIPT__")
         .limit(50);
 
-      if (stuckRows && stuckRows.length > 0) {
-        const stuckIds = stuckRows.map((r: any) => r.id);
-        console.log(`INGEST_BG resetting ${stuckIds.length} stuck episodes`, stuckIds);
-
-        const { error: resetErr } = await supabaseAdmin
+      if (processingRows && processingRows.length > 0) {
+        const processingIds = processingRows.map((r: any) => r.id);
+        console.log(`INGEST_BG clearing ${processingIds.length} stale processing markers`, processingIds);
+        await supabaseAdmin
           .from("episodes")
           .update({ transcript: null })
-          .in("id", stuckIds);
+          .in("id", processingIds);
+      }
 
-        if (resetErr) console.log("INGEST_BG reset error", resetErr.message);
+      // Only reset error states when explicitly requested
+      if (resetStuck) {
+        const { data: errorRows } = await supabaseAdmin
+          .from("episodes")
+          .select("id")
+          .like("transcript", "__ERROR__%")
+          .limit(50);
+
+        if (errorRows && errorRows.length > 0) {
+          const errorIds = errorRows.map((r: any) => r.id);
+          console.log(`INGEST_BG resetting ${errorIds.length} error episodes`, errorIds);
+          await supabaseAdmin
+            .from("episodes")
+            .update({ transcript: null })
+            .in("id", errorIds);
+        }
       }
     }
 
