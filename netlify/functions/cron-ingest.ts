@@ -21,5 +21,5 @@ const run: Handler = async () => {
   return { statusCode: 200 };
 };
 
-// Runs daily at 23:30 UTC (adjust below if you want)
-export const handler = schedule("0 21 * * *", run);
+// Runs every 30 minutes to catch up on missed episodes
+export const handler = schedule("*/30 * * * *", run);
