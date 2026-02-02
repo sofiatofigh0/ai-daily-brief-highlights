@@ -20,5 +20,5 @@ const run: Handler = async () => {
   return { statusCode: 200 };
 };
 
-// Runs daily at 23:40 UTC (10 min after ingest)
-export const handler = schedule("10 21 * * *", run);
+// Runs every 30 minutes at :15 and :45 (offset from ingest at :00 and :30)
+export const handler = schedule("15,45 * * * *", run);
