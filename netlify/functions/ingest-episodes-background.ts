@@ -210,7 +210,14 @@ export const handler: Handler = async (event: HandlerEvent) => {
 
     if (fetchErr) throw new Error(`Fetch episodes failed: ${fetchErr.message}`);
 
-    const candidates = (rows || []).filter((r: any) => !isRealTranscript(r.transcript));
+    // Filter for episodes that need transcription
+    // Skip __ERROR__ episodes unless reset_stuck=true (they'll just fail again)
+    const candidates = (rows || []).filter((r: any) => {
+      if (!r.transcript || typeof r.transcript !== "string") return true; // null/undefined = needs work
+      if (r.transcript === "__PROCESSING_TRANSCRIPT__") return true; // stale marker (should be cleared above)
+      if (r.transcript.startsWith("__ERROR__")) return resetStuck; // only retry errors if explicitly requested
+      return r.transcript.length <= 2000; // too short = incomplete
+    });
     const toProcess = candidates.slice(0, EPISODES_PER_RUN);
 
     console.log("INGEST_BG transcript candidates", {
