@@ -1,11 +1,15 @@
 import type { Handler } from "@netlify/functions";
 import { schedule } from "@netlify/functions";
 
+const resolveBaseUrl = () =>
+  process.env.URL ||
+  process.env.DEPLOY_PRIME_URL ||
+  process.env.DEPLOY_URL ||
+  process.env.SITE_URL ||
+  process.env.NETLIFY_URL;
+
 const run: Handler = async () => {
-  const base =
-    process.env.URL ||
-    process.env.DEPLOY_PRIME_URL ||
-    process.env.DEPLOY_URL;
+  const base = resolveBaseUrl();
 
   if (!base) {
     console.log("CRON_SUMMARIZE missing site URL env var");
@@ -15,7 +19,12 @@ const run: Handler = async () => {
   const target = `${base}/.netlify/functions/summarize-episodes-background`;
   console.log("CRON_SUMMARIZE triggering", target);
 
-  fetch(target).catch((e) => console.log("CRON_SUMMARIZE fetch error", e?.message || e));
+  try {
+    const response = await fetch(target);
+    console.log("CRON_SUMMARIZE response", response.status);
+  } catch (e: any) {
+    console.log("CRON_SUMMARIZE fetch error", e?.message || e);
+  }
 
   return { statusCode: 200 };
 };
