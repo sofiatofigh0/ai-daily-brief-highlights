@@ -356,6 +356,8 @@ export const handler: Handler = async (event: HandlerEvent) => {
     const allCandidates = (rows || [])
       .filter((r: any) => {
         if (!isRealTranscript(r.transcript)) return false;
+        // Skip episodes with highlights_error unless reset_all (they'll just fail again)
+        if (r.highlights_error && !resetAll) return false;
         const missingHighlights = r.highlights == null || isEmptyObject(r.highlights);
         const missingSources = isEmptySources(r.sources);
         return missingHighlights || missingSources;
